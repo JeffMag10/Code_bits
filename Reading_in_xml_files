@@ -1,0 +1,156 @@
+"""
+@author: jmagouri
+@author: Daniel James
+@author: Justin Smith
+
+This reading retro_CCDs and parse files which are xml.
+
+"""
+####
+
+
+
+############### Loading the needed packages
+import sys
+import getpass
+import datetime
+import time
+
+import datetime
+import os
+import openpyxl
+import lxml
+import re
+import numpy as np
+import glob
+import pandas as pd
+import pyspark
+import pyarrow
+import fastparquet
+import re
+from bs4 import BeautifulSoup as bs
+from IPython.core.display import display, HTML
+import pprint
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import input_file_name
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import functions as f
+from pyspark.sql.types import StringType, ArrayType, StructType, StructField, IntegerType
+from pyspark.sql.dataframe import DataFrame
+import re
+
+from pyspark.sql.window import Window
+
+from retro_CCDs_config import time_log_start, time_log_finish, cache_greedy, transform
+
+# For Pyspark DataFrame method chaining
+
+DataFrame.transform = transform
+
+DataFrame.cache_greedy = cache_greedy
+#files_all = []
+def load_files_as_column(path, partitions):
+    # Function to read in the file
+    def readFile(file):
+        with open(file, 'r') as fd:
+            return fd.read()
+    readFile_udf = f.udf(readFile,StringType())
+    files_all = glob.glob(f'/mapr{path}')
+    files_all_df = spark.createDataFrame(list(map(lambda x: tuple([x]), files_all)),schema=['path'])
+    files_all_df = files_all_df.repartition(partitions)
+    return files_all_df.withColumn('contents',readFile_udf(f.col('path')))  
+
+##### Next Section ###################
+### Setting up a spark session 
+print('Setting up a spark session',time_log_start())
+spark = (
+        SparkSession.builder.appName("Reading in CCDS")
+        .config("spark.executor.memoryOverhead", 16192)
+        .config("spark.sql.orc.filterPushdown", "true")
+        .config("spark.sql.cbo.enabled", "true")
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.kryoserializer.buffer.max", 512)
+        .config("spark.default.parallelism", 5000)
+        .config("spark.sql.shuffle.partitions", 5000)
+        .config("spark.sql.parquet.enableVectorizedReader", "false")
+        .enableHiveSupport()
+        .getOrCreate()
+    )
+print('Spark session set-up =',time_log_finish())
+
+###Getting the CCDS
+
+print('Getting the CCDs ',time_log_start())
+path = os.getcwd()
+print(path)
+
+from retro_CCDs_config import master as Ms
+time_log_start()
+#Ms.insert_event_log()
+
+###Setting up some of the variables
+
+curr_date=datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d')
+input_path       =Ms.input_path
+output_path      =Ms.output_path
+
+
+# Set the main top-level directory for the CCDs
+input_path_0 = input_path.replace('/mapr','')
+CCDA_directory = os.path.join(input_path_0,'supplemental/*/CCDA_*.xml')
+ccda_directory = os.path.join(input_path_0,'supplemental/*/ccda_*.xml')
+# Function to load the files in parallel => 100s times speedup
+CCDAs_unparsed = load_files_as_column(CCDA_directory,8000)
+ccdas_unparsed = load_files_as_column(ccda_directory,8000)
+print('Number of records:CCDa = ',CCDAs_unparsed.count())
+print('Number of records:ccda = ',ccdas_unparsed.count())
+
+print(CCDAs_unparsed.printSchema())
+print(ccdas_unparsed.printSchema())
+
+CCDs = CCDAs_unparsed.union(ccdas_unparsed)
+
+print('Numberof records - ',CCDs.count())
+
+CCDs = CCDs.withColumn('barcode', split(CCDs['path'], "/").getItem(11))
+CCDs = CCDs.select('barcode','contents')
+print(CCDs.select('barcode').show(n=5,truncate=False))
+
+print(CCDs.printSchema())
+time_log_finish()
+
+###Reading in the CCDs into Beautiful Soup
+def make_beautiful(xml):
+        return bs(xml,'lxml').text
+    
+parsed_ccd_udf = f.udf(make_beautiful)    
+time_log_start()    
+CCDs = CCDs.withColumn('text',parsed_ccd_udf(f.col('contents'))) 
+CCDs = CCDs.select('barcode','text')
+CCDs.printSchema()
+
+
+##Putting all of the CCDs together. Creating the format for CAML
+
+print('Creating CCDs for CAML',time_log_start())
+
+cols = list(set(CCDs.columns) - {'barcode'})
+ccd = CCDs.select("barcode", f.regexp_replace(f.concat_ws(" ", *cols), r"\t", " ").alias("page_content"))
+#Concatenate the ccd's together by barcode.
+win = Window.partitionBy("barcode")
+ccd = (
+    ccd.withColumn("page_content", f.collect_list("page_content").over(win))
+    .groupBy("barcode")
+    .agg(f.max("page_content").alias("page_content"))
+    .withColumn("page_content", f.concat_ws(" ", f.col("page_content")))
+)
+time_log_finish()
+      
+print('Outputting to parquet file for use by CAML', time_log_start())
+ccd.count()
+file_out = os.path.join(output_path,'ccd_retro_parquet')
+ccd.write.mode('overwrite').parquet(file_out)
+time_log_finish()    
+spark.stop()
